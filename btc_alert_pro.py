@@ -9,7 +9,7 @@ from telegram import Bot
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "8737159926:AAGEAPNigIKy2hPcTgZGajN6PQh9MHncVso"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = "@btcalertademo"
 
 CHECK_INTERVAL = 30           # segundos
