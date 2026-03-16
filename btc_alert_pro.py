@@ -1,22 +1,56 @@
+import os
 import asyncio
-import requests
-from telegram import Bot
 from datetime import datetime
 
+import requests
+from telegram import Bot
+
+
+# =========================
+# CONFIG
+# =========================
 BOT_TOKEN = "8737159926:AAGEAPNigIKy2hPcTgZGajN6PQh9MHncVso"
 CHANNEL_ID = "@btcalertademo"
 
-CHECK_INTERVAL = 30
-ALERT_THRESHOLD = 0.05  # para pruebas
+CHECK_INTERVAL = 30           # segundos
+ALERT_THRESHOLD = 0.05        # porcentaje para pruebas
+REQUEST_TIMEOUT = 10
 
+
+# =========================
+# STATE
+# =========================
 last_price = None
 hour_prices = []
 
 
+# =========================
+# HELPERS
+# =========================
 def get_btc_price():
+    """
+    Obtiene el precio actual de BTC desde CoinGecko.
+    Devuelve float o None si falla.
+    """
     url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-    r = requests.get(url, timeout=10)
-    return float(r.json()["bitcoin"]["usd"])
+
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+
+        if "bitcoin" in data and "usd" in data["bitcoin"]:
+            return float(data["bitcoin"]["usd"])
+
+        print("API response inesperada:", data)
+        return None
+
+    except requests.RequestException as e:
+        print("API Error:", e)
+        return None
+    except (ValueError, TypeError, KeyError) as e:
+        print("Parse Error:", e)
+        return None
 
 
 def format_price(price):
@@ -28,116 +62,127 @@ def current_time():
 
 
 async def send_hourly_summary(bot):
+    """
+    Envía resumen de la última hora.
+    """
     global hour_prices
 
-    if len(hour_prices) == 0:
+    if len(hour_prices) < 2:
         return
 
     current_price = hour_prices[-1]
     first_price = hour_prices[0]
 
     change = ((current_price - first_price) / first_price) * 100
-
     high = max(hour_prices)
     low = min(hour_prices)
 
-    if change > 0.1:
+    if change > 0.10:
         bias = "Alcista"
-    elif change < -0.1:
+    elif change < -0.10:
         bias = "Bajista"
     else:
         bias = "Neutral"
 
-    message = f"""
-📊 BTC RESUMEN 1H
-
-Precio actual: {format_price(current_price)}
-Cambio última hora: {change:+.2f}%
-
-Máximo 1h: {format_price(high)}
-Mínimo 1h: {format_price(low)}
-
-Sesgo del mercado: {bias}
-Hora: {current_time()} NY
-
-BTC Alert Pro sigue monitoreando el mercado.
-"""
+    message = (
+        "📊 BTC RESUMEN 1H\n\n"
+        f"Precio actual: {format_price(current_price)}\n"
+        f"Cambio última hora: {change:+.2f}%\n\n"
+        f"Máximo 1h: {format_price(high)}\n"
+        f"Mínimo 1h: {format_price(low)}\n\n"
+        f"Sesgo del mercado: {bias}\n"
+        f"Hora: {current_time()} NY\n\n"
+        "BTC Alert Pro sigue monitoreando el mercado."
+    )
 
     await bot.send_message(chat_id=CHANNEL_ID, text=message)
 
+    # reinicia acumulación de la siguiente hora
     hour_prices = []
 
 
+# =========================
+# MAIN
+# =========================
 async def main():
     global last_price, hour_prices
+
+    if not BOT_TOKEN:
+        raise ValueError("No se encontró TELEGRAM_BOT_TOKEN en las variables de entorno.")
 
     bot = Bot(token=BOT_TOKEN)
 
     print("BTC ALERTA PRO iniciado")
 
-    price = get_btc_price()
-    last_price = price
-    hour_prices.append(price)
+    # precio inicial
+    initial_price = get_btc_price()
+    if initial_price is None:
+        raise RuntimeError("No se pudo obtener el precio inicial de BTC.")
+
+    last_price = initial_price
+    hour_prices.append(initial_price)
 
     await bot.send_message(
         chat_id=CHANNEL_ID,
-        text=f"✅ BTC ALERTA PRO iniciado\n\nPrecio actual: {format_price(price)}"
+        text=(
+            "✅ BTC ALERTA PRO iniciado\n\n"
+            f"Precio actual: {format_price(initial_price)}\n"
+            f"Hora: {current_time()} NY"
+        )
     )
 
     counter = 0
 
     while True:
-
         try:
-
             price = get_btc_price()
-            print("BTC:", price)
 
-            hour_prices.append(price)
+            if price is not None:
+                print("BTC:", price)
+                hour_prices.append(price)
 
-            change = ((price - last_price) / last_price) * 100
+                change = ((price - last_price) / last_price) * 100
 
-            if change > ALERT_THRESHOLD:
+                # PUMP
+                if change > ALERT_THRESHOLD:
+                    message = (
+                        "🚨 BTC ALERTA PRO\n\n"
+                        "Movimiento detectado: PUMP\n"
+                        f"Precio actual: {format_price(price)}\n"
+                        f"Cambio: +{change:.4f}%\n"
+                        f"Hora: {current_time()} NY\n"
+                        "Estado: Momentum alcista"
+                    )
 
-                message = f"""
-🚨 BTC ALERTA PRO
+                    await bot.send_message(chat_id=CHANNEL_ID, text=message)
+                    last_price = price
 
-Movimiento detectado: PUMP
-Precio actual: {format_price(price)}
-Cambio: +{change:.4f}%
-Hora: {current_time()} NY
-Estado: Momentum alcista
-"""
+                # DUMP
+                elif change < -ALERT_THRESHOLD:
+                    message = (
+                        "🚨 BTC ALERTA PRO\n\n"
+                        "Movimiento detectado: DUMP\n"
+                        f"Precio actual: {format_price(price)}\n"
+                        f"Cambio: {change:.4f}%\n"
+                        f"Hora: {current_time()} NY\n"
+                        "Estado: Presión bajista"
+                    )
 
-                await bot.send_message(chat_id=CHANNEL_ID, text=message)
+                    await bot.send_message(chat_id=CHANNEL_ID, text=message)
+                    last_price = price
 
-                last_price = price
+                counter += 1
 
-            elif change < -ALERT_THRESHOLD:
+                # cada hora: 30s * 120 = 3600s
+                if counter >= 120:
+                    await send_hourly_summary(bot)
+                    counter = 0
 
-                message = f"""
-🚨 BTC ALERTA PRO
-
-Movimiento detectado: DUMP
-Precio actual: {format_price(price)}
-Cambio: {change:.4f}%
-Hora: {current_time()} NY
-Estado: Presión bajista
-"""
-
-                await bot.send_message(chat_id=CHANNEL_ID, text=message)
-
-                last_price = price
-
-            counter += 1
-
-            # cada hora (30s * 120 = 1 hora)
-            if counter >= 120:
-                await send_hourly_summary(bot)
-                counter = 0
+            else:
+                print("No se obtuvo precio de BTC en este ciclo.")
 
         except Exception as e:
-            print("Error:", e)
+            print("Error general:", e)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
