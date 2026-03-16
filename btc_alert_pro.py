@@ -1,6 +1,7 @@
 import os
 import asyncio
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from telegram import Bot
@@ -58,7 +59,8 @@ def format_price(price):
 
 
 def current_time():
-    return datetime.now().strftime("%I:%M %p")
+    ny_time = datetime.now(ZoneInfo("America/New_York"))
+    return ny_time.strftime("%I:%M %p ET")
 
 
 async def send_hourly_summary(bot):
