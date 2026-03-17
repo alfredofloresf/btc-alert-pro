@@ -16,17 +16,17 @@ CHANNEL_ID = "@btcalertademo"
 CHECK_INTERVAL = 30
 REQUEST_TIMEOUT = 10
 
-# Momentum thresholds
-MOMENTUM_1M_THRESHOLD = 0.05
-MOMENTUM_5M_THRESHOLD = 0.15
-MOMENTUM_15M_THRESHOLD = 0.30
+# Momentum thresholds (más altos)
+MOMENTUM_1M_THRESHOLD = 0.12
+MOMENTUM_5M_THRESHOLD = 0.30
+MOMENTUM_15M_THRESHOLD = 0.70
 
-STRONG_1M_THRESHOLD = 0.10
-STRONG_5M_THRESHOLD = 0.25
-STRONG_15M_THRESHOLD = 0.60
+STRONG_1M_THRESHOLD = 0.25
+STRONG_5M_THRESHOLD = 0.60
+STRONG_15M_THRESHOLD = 1.20
 
 # Cooldown
-ALERT_COOLDOWN_SECONDS = 300  # 5 min
+ALERT_COOLDOWN_SECONDS = 300  # 5 minutos
 
 
 # =========================
@@ -121,7 +121,7 @@ def add_price_to_history(price):
     ts = now_ts()
     price_history.append((ts, price))
 
-    cutoff = ts - (20 * 60)  # mantener últimos 20 minutos
+    cutoff = ts - (20 * 60)
     price_history = [(t, p) for (t, p) in price_history if t >= cutoff]
 
 
