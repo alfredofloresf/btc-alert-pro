@@ -16,7 +16,7 @@ CHANNEL_ID = "@btcalertademo"
 CHECK_INTERVAL = 30
 REQUEST_TIMEOUT = 10
 
-# Momentum thresholds (más altos)
+# Momentum thresholds
 MOMENTUM_1M_THRESHOLD = 0.12
 MOMENTUM_5M_THRESHOLD = 0.30
 MOMENTUM_15M_THRESHOLD = 0.70
@@ -25,7 +25,7 @@ STRONG_1M_THRESHOLD = 0.25
 STRONG_5M_THRESHOLD = 0.60
 STRONG_15M_THRESHOLD = 1.20
 
-# Cooldown
+# Cooldown between momentum alerts
 ALERT_COOLDOWN_SECONDS = 300  # 5 minutos
 
 
@@ -60,19 +60,19 @@ def get_btc_price():
         response.raise_for_status()
         data = response.json()
 
-        if "bitcoin" in data:
+        if "bitcoin" in data and "usd" in data["bitcoin"]:
             return float(data["bitcoin"]["usd"])
 
+        print("API response inesperada:", data)
         return None
 
     except Exception as e:
-        print("API Error:", e)
+        print("API Error BTC:", e)
         return None
 
 
 def get_top_movers():
     url = "https://api.coingecko.com/api/v3/coins/markets"
-
     params = {
         "vs_currency": "usd",
         "order": "price_change_percentage_24h_desc",
@@ -82,16 +82,25 @@ def get_top_movers():
 
     try:
         response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
         data = response.json()
 
+        valid_data = [
+            coin for coin in data
+            if coin.get("price_change_percentage_24h") is not None
+        ]
+
+        if not valid_data:
+            return None, None
+
         gainers = sorted(
-            data,
+            valid_data,
             key=lambda x: x["price_change_percentage_24h"],
             reverse=True
         )[:3]
 
         losers = sorted(
-            data,
+            valid_data,
             key=lambda x: x["price_change_percentage_24h"]
         )[:1]
 
@@ -99,6 +108,38 @@ def get_top_movers():
 
     except Exception as e:
         print("Top movers error:", e)
+        return None, None
+
+
+def get_fear_and_greed():
+    url = "https://api.alternative.me/fng/?limit=1"
+
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+
+        items = data.get("data", [])
+        if not items:
+            return None, None
+
+        value = int(items[0]["value"])
+        classification_en = items[0]["value_classification"]
+
+        translation_map = {
+            "Extreme Fear": "Miedo extremo",
+            "Fear": "Miedo",
+            "Neutral": "Neutral",
+            "Greed": "Codicia",
+            "Extreme Greed": "Codicia extrema",
+        }
+
+        classification_es = translation_map.get(classification_en, classification_en)
+
+        return value, classification_es
+
+    except Exception as e:
+        print("Fear & Greed error:", e)
         return None, None
 
 
@@ -122,7 +163,7 @@ def get_price_ago(seconds_ago):
 
 
 def percent_change(current_price, previous_price):
-    if previous_price is None:
+    if previous_price is None or previous_price == 0:
         return None
     return ((current_price - previous_price) / previous_price) * 100
 
@@ -135,7 +176,6 @@ def can_send_alert():
 # SENDERS
 # =========================
 async def send_top_movers(bot):
-
     gainers, losers = get_top_movers()
 
     if gainers is None:
@@ -164,8 +204,40 @@ async def send_top_movers(bot):
         message += f"{symbol} {change:.2f}%\n"
         message += f"Precio: ${price:,.2f}\n\n"
 
+    btc_price = get_btc_price()
+    if btc_price is not None:
+        message += f"BTC Precio actual: {format_price(btc_price)}\n\n"
+
     message += f"Hora: {current_time()}\n\n"
     message += "👉 https://t.me/btcalertademo"
+
+    await bot.send_message(chat_id=CHANNEL_ID, text=message)
+
+
+async def send_fear_and_greed(bot):
+    value, sentiment = get_fear_and_greed()
+
+    if value is None:
+        return
+
+    if value <= 24:
+        emoji = "😨"
+    elif value <= 44:
+        emoji = "😟"
+    elif value <= 55:
+        emoji = "😐"
+    elif value <= 74:
+        emoji = "🤑"
+    else:
+        emoji = "🔥"
+
+    message = (
+        "📊 SENTIMIENTO DEL MERCADO\n\n"
+        f"Índice Fear & Greed: {value} {emoji}\n"
+        f"Estado: {sentiment}\n\n"
+        f"Hora: {current_time()}\n\n"
+        "👉 https://t.me/btcalertademo"
+    )
 
     await bot.send_message(chat_id=CHANNEL_ID, text=message)
 
@@ -203,60 +275,138 @@ async def maybe_send_momentum_alert(bot, current_price):
         change_15m <= -MOMENTUM_15M_THRESHOLD,
     ])
 
+    strong_bullish = sum([
+        change_1m >= STRONG_1M_THRESHOLD,
+        change_5m >= STRONG_5M_THRESHOLD,
+        change_15m >= STRONG_15M_THRESHOLD,
+    ])
+
+    strong_bearish = sum([
+        change_1m <= -STRONG_1M_THRESHOLD,
+        change_5m <= -STRONG_5M_THRESHOLD,
+        change_15m <= -STRONG_15M_THRESHOLD,
+    ])
+
+    if strong_bullish >= 2:
+        message = (
+            "🚨 BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM ALCISTA FUERTE\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: +{change_1m:.2f}%\n"
+            f"Cambio 5m: +{change_5m:.2f}%\n"
+            f"Cambio 15m: +{change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Impulso comprador fuerte"
+        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=message)
+        last_alert_time = now_ts()
+        return
+
+    if strong_bearish >= 2:
+        message = (
+            "🚨 BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM BAJISTA FUERTE\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: {change_1m:.2f}%\n"
+            f"Cambio 5m: {change_5m:.2f}%\n"
+            f"Cambio 15m: {change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Presión vendedora fuerte"
+        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=message)
+        last_alert_time = now_ts()
+        return
+
     if bullish >= 2:
         message = (
-            "🚨 BTC MOMENTUM\n\n"
-            "Momentum alcista detectado\n"
-            f"Precio: {format_price(current_price)}\n"
-            f"1m: +{change_1m:.2f}% | 5m: +{change_5m:.2f}% | 15m: +{change_15m:.2f}%\n"
-            f"Hora: {current_time()}"
+            "⚠️ BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM ALCISTA\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: +{change_1m:.2f}%\n"
+            f"Cambio 5m: +{change_5m:.2f}%\n"
+            f"Cambio 15m: +{change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Momentum alcista"
         )
         await bot.send_message(chat_id=CHANNEL_ID, text=message)
         last_alert_time = now_ts()
+        return
 
-    elif bearish >= 2:
+    if bearish >= 2:
         message = (
-            "🚨 BTC MOMENTUM\n\n"
-            "Momentum bajista detectado\n"
-            f"Precio: {format_price(current_price)}\n"
-            f"1m: {change_1m:.2f}% | 5m: {change_5m:.2f}% | 15m: {change_15m:.2f}%\n"
-            f"Hora: {current_time()}"
+            "⚠️ BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM BAJISTA\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: {change_1m:.2f}%\n"
+            f"Cambio 5m: {change_5m:.2f}%\n"
+            f"Cambio 15m: {change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Momentum bajista"
         )
         await bot.send_message(chat_id=CHANNEL_ID, text=message)
         last_alert_time = now_ts()
+        return
 
 
 # =========================
 # MAIN
 # =========================
 async def main():
-
     if not BOT_TOKEN:
-        raise ValueError("Falta TELEGRAM_BOT_TOKEN")
+        raise ValueError("No se encontró TELEGRAM_BOT_TOKEN en variables de entorno.")
 
     bot = Bot(token=BOT_TOKEN)
 
-    print("BOT ACTIVO")
+    print("BTC MOMENTUM PRO iniciado")
+
+    initial_price = get_btc_price()
+    if initial_price is None:
+        raise RuntimeError("No se pudo obtener el precio inicial de BTC.")
+
+    add_price_to_history(initial_price)
+
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=(
+            "✅ BTC MOMENTUM PRO iniciado\n\n"
+            f"Precio actual: {format_price(initial_price)}\n"
+            f"Hora: {current_time()}\n"
+            "Modo: Momentum + Top Movers + Fear & Greed"
+        )
+    )
 
     top_movers_counter = 0
+    fear_greed_counter = 0
 
     while True:
         try:
             price = get_btc_price()
 
-            if price:
+            if price is not None:
+                print("BTC:", price)
+
                 add_price_to_history(price)
+
                 await maybe_send_momentum_alert(bot, price)
 
                 top_movers_counter += 1
+                fear_greed_counter += 1
 
                 # cada 4 horas
                 if top_movers_counter >= 480:
                     await send_top_movers(bot)
                     top_movers_counter = 0
 
+                # cada 8 horas
+                if fear_greed_counter >= 960:
+                    await send_fear_and_greed(bot)
+                    fear_greed_counter = 0
+
+            else:
+                print("No se obtuvo precio en este ciclo.")
+
         except Exception as e:
-            print("Error:", e)
+            print("Error general:", e)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
