@@ -1,227 +1,89 @@
 import os
 import asyncio
-import logging
-import time
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, List, Tuple
-
-import aiohttp
 from zoneinfo import ZoneInfo
+
+import requests
 from telegram import Bot
-from telegram.error import TelegramError
 
 
 # =========================
 # CONFIG
 # =========================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@btcalertademo")
+CHANNEL_ID = "@btcalertademo"
 
 CHECK_INTERVAL = 30
 REQUEST_TIMEOUT = 10
 
-SIGNAL_COOLDOWN_SECONDS = 1800  # 30 min
+# Momentum thresholds
+MOMENTUM_1M_THRESHOLD = 0.12
+MOMENTUM_5M_THRESHOLD = 0.30
+MOMENTUM_15M_THRESHOLD = 0.70
 
-TOP_MOVERS_EVERY_SECONDS = 4 * 60 * 60      # 4h
-FEAR_GREED_EVERY_SECONDS = 8 * 60 * 60      # 8h
-TRADE_SIGNAL_EVERY_SECONDS = 30 * 60        # 30m
+STRONG_1M_THRESHOLD = 0.25
+STRONG_5M_THRESHOLD = 0.60
+STRONG_15M_THRESHOLD = 1.20
 
-MACRO_CACHE_TTL = 60 * 60                   # 1h
-TOP_MOVERS_CACHE_TTL = 30 * 60              # 30m
-FEAR_GREED_CACHE_TTL = 30 * 60              # 30m
-
-PRICE_HISTORY_WINDOW_SECONDS = 20 * 60      # 20 minutes
-
-
-# =========================
-# LOGGING
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger("btc_bot")
+# Cooldown between momentum alerts
+ALERT_COOLDOWN_SECONDS = 300  # 5 minutos
 
 
 # =========================
-# DATA CLASSES
+# STATE
 # =========================
-@dataclass
-class MacroContext:
-    trend_30d: str
-    trend_1y: str
-    ema_200: Optional[float]
-    ema_status: str
-    current_daily_price: float
-
-
-@dataclass
-class ShortBias:
-    bias: str
-    change_1m: float
-    change_5m: float
-    change_15m: float
-
-
-@dataclass
-class CacheItem:
-    value: object = None
-    expires_at: float = 0.0
-
-    def valid(self) -> bool:
-        return time.time() < self.expires_at
-
-
-@dataclass
-class BotState:
-    price_history: List[Tuple[float, float]] = field(default_factory=list)
-    last_signal_time: float = 0.0
-    last_signal_sent: Optional[str] = None
-    last_top_movers_sent: float = 0.0
-    last_fear_greed_sent: float = 0.0
-    last_trade_signal_check: float = 0.0
-    macro_cache: CacheItem = field(default_factory=CacheItem)
-    top_movers_cache: CacheItem = field(default_factory=CacheItem)
-    fear_greed_cache: CacheItem = field(default_factory=CacheItem)
+price_history = []
+last_alert_time = 0
 
 
 # =========================
-# BOT CLASS
+# HELPERS
 # =========================
-class BTCDecisionBot:
-    def __init__(self, token: str, channel_id: str):
-        if not token:
-            raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
+def now_ts():
+    return datetime.now().timestamp()
 
-        self.bot = Bot(token=token)
-        self.channel_id = channel_id
-        self.state = BotState()
-        self.session: Optional[aiohttp.ClientSession] = None
 
-    async def __aenter__(self):
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-        self.session = aiohttp.ClientSession(timeout=timeout)
-        return self
+def current_time():
+    ny_time = datetime.now(ZoneInfo("America/New_York"))
+    return ny_time.strftime("%I:%M %p ET")
 
-    async def __aexit__(self, exc_type, exc, tb):
-        if self.session:
-            await self.session.close()
 
-    # =========================
-    # HELPERS
-    # =========================
-    @staticmethod
-    def now_ts() -> float:
-        return time.time()
+def format_price(price):
+    return f"${price:,.2f}"
 
-    @staticmethod
-    def current_time() -> str:
-        ny_time = datetime.now(ZoneInfo("America/New_York"))
-        return ny_time.strftime("%I:%M %p ET")
 
-    @staticmethod
-    def format_price(price: float) -> str:
-        return f"${price:,.2f}"
+def get_btc_price():
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
 
-    @staticmethod
-    def percent_change(current_price: float, previous_price: Optional[float]) -> Optional[float]:
-        if previous_price is None or previous_price == 0:
-            return None
-        return ((current_price - previous_price) / previous_price) * 100
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
 
-    @staticmethod
-    def classify_trend(prices: List[float]) -> str:
-        if not prices or len(prices) < 2:
-            return "Neutral"
+        if "bitcoin" in data and "usd" in data["bitcoin"]:
+            return float(data["bitcoin"]["usd"])
 
-        change = BTCDecisionBot.percent_change(prices[-1], prices[0])
-        if change is None:
-            return "Neutral"
-        if change > 5:
-            return "Alcista"
-        if change < -5:
-            return "Bajista"
-        return "Neutral"
-
-    @staticmethod
-    def calculate_ema(prices: List[float], period: int = 200) -> Optional[float]:
-        if not prices or len(prices) < period:
-            return None
-
-        k = 2 / (period + 1)
-        ema = sum(prices[:period]) / period
-
-        for price in prices[period:]:
-            ema = (price * k) + (ema * (1 - k))
-
-        return ema
-
-    # =========================
-    # HTTP
-    # =========================
-    async def fetch_json(self, url: str, params: dict | None = None, retries: int = 3) -> Optional[dict]:
-        assert self.session is not None, "HTTP session not initialized"
-
-        for attempt in range(1, retries + 1):
-            try:
-                async with self.session.get(url, params=params) as response:
-                    response.raise_for_status()
-                    return await response.json()
-            except Exception as e:
-                logger.warning("HTTP error on %s (attempt %s/%s): %s", url, attempt, retries, e)
-                if attempt < retries:
-                    await asyncio.sleep(1.5 * attempt)
-
+        print("API response inesperada:", data)
         return None
 
-    # =========================
-    # API METHODS
-    # =========================
-    async def get_btc_price(self) -> Optional[float]:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {"ids": "bitcoin", "vs_currencies": "usd"}
-        data = await self.fetch_json(url, params=params)
+    except Exception as e:
+        print("API Error BTC:", e)
+        return None
 
-        if not data:
-            return None
 
-        try:
-            return float(data["bitcoin"]["usd"])
-        except (KeyError, TypeError, ValueError):
-            logger.warning("Unexpected BTC price response: %s", data)
-            return None
+def get_top_movers():
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "price_change_percentage_24h_desc",
+        "per_page": 10,
+        "page": 1,
+    }
 
-    async def get_historical_prices(self, days: int) -> Optional[List[float]]:
-        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-        params = {
-            "vs_currency": "usd",
-            "days": days,
-            "interval": "daily",
-        }
-        data = await self.fetch_json(url, params=params)
-
-        if not data:
-            return None
-
-        prices = [item[1] for item in data.get("prices", []) if len(item) >= 2]
-        return prices or None
-
-    async def get_top_movers(self):
-        if self.state.top_movers_cache.valid():
-            return self.state.top_movers_cache.value
-
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "price_change_percentage_24h_desc",
-            "per_page": 10,
-            "page": 1,
-        }
-        data = await self.fetch_json(url, params=params)
-
-        if not data:
-            return None
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
 
         valid_data = [
             coin for coin in data
@@ -229,7 +91,7 @@ class BTCDecisionBot:
         ]
 
         if not valid_data:
-            return None
+            return None, None
 
         gainers = sorted(
             valid_data,
@@ -242,34 +104,27 @@ class BTCDecisionBot:
             key=lambda x: x["price_change_percentage_24h"]
         )[:1]
 
-        result = (gainers, losers)
-        self.state.top_movers_cache = CacheItem(
-            value=result,
-            expires_at=self.now_ts() + TOP_MOVERS_CACHE_TTL
-        )
-        return result
+        return gainers, losers
 
-    async def get_fear_and_greed(self):
-        if self.state.fear_greed_cache.valid():
-            return self.state.fear_greed_cache.value
+    except Exception as e:
+        print("Top movers error:", e)
+        return None, None
 
-        url = "https://api.alternative.me/fng/"
-        params = {"limit": 1}
-        data = await self.fetch_json(url, params=params)
 
-        if not data:
-            return None
+def get_fear_and_greed():
+    url = "https://api.alternative.me/fng/?limit=1"
+
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
 
         items = data.get("data", [])
         if not items:
-            return None
+            return None, None
 
-        try:
-            value = int(items[0]["value"])
-            classification_en = items[0]["value_classification"]
-        except (KeyError, ValueError, TypeError):
-            logger.warning("Unexpected Fear & Greed response: %s", data)
-            return None
+        value = int(items[0]["value"])
+        classification_en = items[0]["value_classification"]
 
         translation_map = {
             "Extreme Fear": "Miedo extremo",
@@ -279,376 +134,281 @@ class BTCDecisionBot:
             "Extreme Greed": "Codicia extrema",
         }
 
-        result = (value, translation_map.get(classification_en, classification_en))
-        self.state.fear_greed_cache = CacheItem(
-            value=result,
-            expires_at=self.now_ts() + FEAR_GREED_CACHE_TTL
-        )
-        return result
+        classification_es = translation_map.get(classification_en, classification_en)
 
-    async def get_macro_context(self) -> Optional[MacroContext]:
-        if self.state.macro_cache.valid():
-            return self.state.macro_cache.value
+        return value, classification_es
 
-        prices_30d, prices_1y = await asyncio.gather(
-            self.get_historical_prices(30),
-            self.get_historical_prices(365),
-        )
+    except Exception as e:
+        print("Fear & Greed error:", e)
+        return None, None
 
-        if not prices_30d or not prices_1y:
-            return None
 
-        trend_30d = self.classify_trend(prices_30d)
-        trend_1y = self.classify_trend(prices_1y)
+def add_price_to_history(price):
+    global price_history
 
-        ema_200 = self.calculate_ema(prices_1y, 200)
-        current_daily_price = prices_1y[-1]
+    ts = now_ts()
+    price_history.append((ts, price))
 
-        if ema_200 is None:
-            ema_status = "Neutral"
-        elif current_daily_price > ema_200:
-            ema_status = "Precio arriba"
-        elif current_daily_price < ema_200:
-            ema_status = "Precio abajo"
-        else:
-            ema_status = "Neutral"
+    cutoff = ts - (20 * 60)
+    price_history = [(t, p) for (t, p) in price_history if t >= cutoff]
 
-        macro = MacroContext(
-            trend_30d=trend_30d,
-            trend_1y=trend_1y,
-            ema_200=ema_200,
-            ema_status=ema_status,
-            current_daily_price=current_daily_price,
-        )
 
-        self.state.macro_cache = CacheItem(
-            value=macro,
-            expires_at=self.now_ts() + MACRO_CACHE_TTL
-        )
-        return macro
+def get_price_ago(seconds_ago):
+    if not price_history:
+        return None
 
-    # =========================
-    # PRICE HISTORY
-    # =========================
-    def add_price_to_history(self, price: float) -> None:
-        ts = self.now_ts()
-        self.state.price_history.append((ts, price))
+    target = now_ts() - seconds_ago
+    closest = min(price_history, key=lambda x: abs(x[0] - target))
+    return closest[1]
 
-        cutoff = ts - PRICE_HISTORY_WINDOW_SECONDS
-        self.state.price_history = [
-            (t, p) for (t, p) in self.state.price_history if t >= cutoff
-        ]
 
-    def get_price_ago(self, seconds_ago: int) -> Optional[float]:
-        if not self.state.price_history:
-            return None
+def percent_change(current_price, previous_price):
+    if previous_price is None or previous_price == 0:
+        return None
+    return ((current_price - previous_price) / previous_price) * 100
 
-        target = self.now_ts() - seconds_ago
-        closest = min(self.state.price_history, key=lambda x: abs(x[0] - target))
-        return closest[1]
 
-    def evaluate_short_term_bias(self, current_price: float) -> Optional[ShortBias]:
-        price_1m = self.get_price_ago(60)
-        price_5m = self.get_price_ago(300)
-        price_15m = self.get_price_ago(900)
-
-        change_1m = self.percent_change(current_price, price_1m)
-        change_5m = self.percent_change(current_price, price_5m)
-        change_15m = self.percent_change(current_price, price_15m)
-
-        if change_1m is None or change_5m is None or change_15m is None:
-            return None
-
-        bullish = sum([change_1m > 0, change_5m > 0, change_15m > 0])
-        bearish = sum([change_1m < 0, change_5m < 0, change_15m < 0])
-
-        if bullish >= 2:
-            bias = "Alcista"
-        elif bearish >= 2:
-            bias = "Bajista"
-        else:
-            bias = "Neutral"
-
-        return ShortBias(
-            bias=bias,
-            change_1m=change_1m,
-            change_5m=change_5m,
-            change_15m=change_15m,
-        )
-
-    # =========================
-    # SIGNAL LOGIC
-    # =========================
-    @staticmethod
-    def build_score(short_bias: str, trend_30d: str, trend_1y: str, ema_status: str):
-        bullish_score = 0
-        bearish_score = 0
-
-        if short_bias == "Alcista":
-            bullish_score += 1
-        elif short_bias == "Bajista":
-            bearish_score += 1
-
-        if trend_30d == "Alcista":
-            bullish_score += 2
-        elif trend_30d == "Bajista":
-            bearish_score += 2
-
-        if trend_1y == "Alcista":
-            bullish_score += 3
-        elif trend_1y == "Bajista":
-            bearish_score += 3
-
-        if ema_status == "Precio arriba":
-            bullish_score += 2
-        elif ema_status == "Precio abajo":
-            bearish_score += 2
-
-        return bullish_score, bearish_score
-
-    def decide_signal(self, short_bias: str, trend_30d: str, trend_1y: str, ema_status: str):
-        bullish_score, bearish_score = self.build_score(short_bias, trend_30d, trend_1y, ema_status)
-
-        if bullish_score >= 5 and bullish_score > bearish_score:
-            return "BUY", min(10, 5 + (bullish_score - bearish_score))
-        elif bearish_score >= 5 and bearish_score > bullish_score:
-            return "SELL", min(10, 5 + (bearish_score - bullish_score))
-        else:
-            return "WAIT", 6
-
-    @staticmethod
-    def build_conclusion(decision: str, short_bias: str, trend_30d: str, trend_1y: str, ema_status: str) -> str:
-        if decision == "BUY":
-            if trend_1y == "Alcista" and trend_30d == "Alcista":
-                return "Tendencia fuerte alcista en marcos amplios."
-            if ema_status == "Precio arriba":
-                return "El precio sigue por encima de la EMA 200, con sesgo positivo."
-            return "Hay alineación suficiente al alza para considerar compra."
-
-        if decision == "SELL":
-            if trend_1y == "Bajista" and trend_30d == "Bajista":
-                return "Tendencia bajista clara en marcos amplios."
-            if ema_status == "Precio abajo":
-                return "El precio está por debajo de la EMA 200, con sesgo negativo."
-            return "La debilidad del mercado favorece una señal de venta."
-
-        if short_bias == "Neutral" and trend_30d == "Neutral":
-            return "No hay confirmación clara por ahora."
-        if trend_1y == "Alcista" and short_bias == "Bajista":
-            return "La tendencia macro sigue positiva, pero el corto plazo está débil."
-        if trend_1y == "Bajista" and short_bias == "Alcista":
-            return "Hay rebote de corto plazo, pero el contexto macro sigue débil."
-
-        return "Las señales están mezcladas. Mejor esperar confirmación."
-
-    def can_send_signal(self) -> bool:
-        return (self.now_ts() - self.state.last_signal_time) >= SIGNAL_COOLDOWN_SECONDS
-
-    # =========================
-    # TELEGRAM
-    # =========================
-    async def send_message(self, text: str) -> None:
-        try:
-            await self.bot.send_message(chat_id=self.channel_id, text=text)
-        except TelegramError as e:
-            logger.error("Telegram send error: %s", e)
-
-    async def send_top_movers(self):
-        result = await self.get_top_movers()
-        if not result:
-            return
-
-        gainers, losers = result
-        medals = ["🥇", "🥈", "🥉"]
-
-        message = "📊 CRYPTO TOP MOVERS\n\n"
-        message += "🚀 Top Ganadores (24h)\n\n"
-
-        for i, coin in enumerate(gainers):
-            symbol = coin["symbol"].upper()
-            change = coin["price_change_percentage_24h"]
-            price = coin["current_price"]
-
-            sign = "+" if change >= 0 else ""
-            message += f"{medals[i]} {symbol} {sign}{change:.2f}%\n"
-            message += f"Precio: ${price:,.2f}\n\n"
-
-        message += "📉 Top Perdedor\n\n"
-
-        for coin in losers:
-            symbol = coin["symbol"].upper()
-            change = coin["price_change_percentage_24h"]
-            price = coin["current_price"]
-            sign = "+" if change >= 0 else ""
-
-            message += f"{symbol} {sign}{change:.2f}%\n"
-            message += f"Precio: ${price:,.2f}\n\n"
-
-        btc_price = await self.get_btc_price()
-        if btc_price is not None:
-            message += f"BTC Precio actual: {self.format_price(btc_price)}\n\n"
-
-        message += f"Hora: {self.current_time()}\n\n"
-        message += "👉 https://t.me/btcalertademo"
-
-        await self.send_message(message)
-        self.state.last_top_movers_sent = self.now_ts()
-
-    async def send_fear_and_greed(self):
-        result = await self.get_fear_and_greed()
-        if not result:
-            return
-
-        value, sentiment = result
-
-        if value <= 24:
-            emoji = "😨"
-        elif value <= 44:
-            emoji = "😟"
-        elif value <= 55:
-            emoji = "😐"
-        elif value <= 74:
-            emoji = "🤑"
-        else:
-            emoji = "🔥"
-
-        message = (
-            "📊 SENTIMIENTO DEL MERCADO\n\n"
-            f"Índice Fear & Greed: {value} {emoji}\n"
-            f"Estado: {sentiment}\n\n"
-            f"Hora: {self.current_time()}\n\n"
-            "👉 https://t.me/btcalertademo"
-        )
-
-        await self.send_message(message)
-        self.state.last_fear_greed_sent = self.now_ts()
-
-    async def maybe_send_trade_signal(self, current_price: float):
-        if not self.can_send_signal():
-            return
-
-        short_term = self.evaluate_short_term_bias(current_price)
-        macro = await self.get_macro_context()
-
-        if short_term is None or macro is None:
-            logger.info("Not enough data yet for trade signal.")
-            return
-
-        decision, confidence = self.decide_signal(
-            short_term.bias,
-            macro.trend_30d,
-            macro.trend_1y,
-            macro.ema_status,
-        )
-
-        if decision == self.state.last_signal_sent:
-            logger.info("Skipping duplicate signal: %s", decision)
-            return
-
-        conclusion = self.build_conclusion(
-            decision,
-            short_term.bias,
-            macro.trend_30d,
-            macro.trend_1y,
-            macro.ema_status,
-        )
-
-        emoji = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡"}[decision]
-
-        message = (
-            f"{emoji} BTC SIGNAL\n\n"
-            f"Decisión: {decision}\n"
-            f"Precio actual: {self.format_price(current_price)}\n\n"
-            "Contexto:\n"
-            f"• Sesgo corto plazo: {short_term.bias}\n"
-            f"• Tendencia 30d: {macro.trend_30d}\n"
-            f"• Tendencia 1y: {macro.trend_1y}\n"
-            f"• EMA 200: {macro.ema_status}\n\n"
-            "Conclusión:\n"
-            f"{conclusion}\n\n"
-            f"Confianza: {confidence}/10\n"
-            f"Hora: {self.current_time()}"
-        )
-
-        await self.send_message(message)
-
-        self.state.last_signal_time = self.now_ts()
-        self.state.last_signal_sent = decision
-        self.state.last_trade_signal_check = self.now_ts()
-
-    # =========================
-    # SCHEDULING
-    # =========================
-    def should_send_top_movers(self) -> bool:
-        return (self.now_ts() - self.state.last_top_movers_sent) >= TOP_MOVERS_EVERY_SECONDS
-
-    def should_send_fear_greed(self) -> bool:
-        return (self.now_ts() - self.state.last_fear_greed_sent) >= FEAR_GREED_EVERY_SECONDS
-
-    def should_check_trade_signal(self) -> bool:
-        return (self.now_ts() - self.state.last_trade_signal_check) >= TRADE_SIGNAL_EVERY_SECONDS
-
-    # =========================
-    # MAIN LOOP
-    # =========================
-    async def run(self):
-        logger.info("BTC DECISION BOT PRO started")
-
-        initial_price = await self.get_btc_price()
-        if initial_price is None:
-            raise RuntimeError("Could not get initial BTC price.")
-
-        self.add_price_to_history(initial_price)
-
-        await self.send_message(
-            "✅ BTC DECISION BOT PRO iniciado\n\n"
-            f"Precio actual: {self.format_price(initial_price)}\n"
-            f"Hora: {self.current_time()}\n"
-            "Modo: BUY / SELL / WAIT + Top Movers + Fear & Greed + EMA 200"
-        )
-
-        # allow periodic jobs to run relative to startup
-        now = self.now_ts()
-        self.state.last_top_movers_sent = now
-        self.state.last_fear_greed_sent = now
-        self.state.last_trade_signal_check = now - TRADE_SIGNAL_EVERY_SECONDS
-
-        while True:
-            try:
-                price = await self.get_btc_price()
-
-                if price is not None:
-                    logger.info("BTC: %s", price)
-                    self.add_price_to_history(price)
-
-                    tasks = []
-
-                    if self.should_send_top_movers():
-                        tasks.append(self.send_top_movers())
-
-                    if self.should_send_fear_greed():
-                        tasks.append(self.send_fear_and_greed())
-
-                    if self.should_check_trade_signal():
-                        tasks.append(self.maybe_send_trade_signal(price))
-
-                    if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                else:
-                    logger.warning("No BTC price received this cycle.")
-
-            except Exception as e:
-                logger.exception("General error in main loop: %s", e)
-
-            await asyncio.sleep(CHECK_INTERVAL)
+def can_send_alert():
+    return (now_ts() - last_alert_time) >= ALERT_COOLDOWN_SECONDS
 
 
 # =========================
-# ENTRY POINT
+# SENDERS
+# =========================
+async def send_top_movers(bot):
+    gainers, losers = get_top_movers()
+
+    if gainers is None:
+        return
+
+    message = "📊 CRYPTO TOP MOVERS\n\n"
+    message += "🚀 Top Ganadores (24h)\n\n"
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    for i, coin in enumerate(gainers):
+        symbol = coin["symbol"].upper()
+        change = coin["price_change_percentage_24h"]
+        price = coin["current_price"]
+
+        message += f"{medals[i]} {symbol} +{change:.2f}%\n"
+        message += f"Precio: ${price:,.2f}\n\n"
+
+    message += "📉 Top Perdedor\n\n"
+
+    for coin in losers:
+        symbol = coin["symbol"].upper()
+        change = coin["price_change_percentage_24h"]
+        price = coin["current_price"]
+
+        message += f"{symbol} {change:.2f}%\n"
+        message += f"Precio: ${price:,.2f}\n\n"
+
+    btc_price = get_btc_price()
+    if btc_price is not None:
+        message += f"BTC Precio actual: {format_price(btc_price)}\n\n"
+
+    message += f"Hora: {current_time()}\n\n"
+    message += "👉 https://t.me/btcalertademo"
+
+    await bot.send_message(chat_id=CHANNEL_ID, text=message)
+
+
+async def send_fear_and_greed(bot):
+    value, sentiment = get_fear_and_greed()
+
+    if value is None:
+        return
+
+    if value <= 24:
+        emoji = "😨"
+    elif value <= 44:
+        emoji = "😟"
+    elif value <= 55:
+        emoji = "😐"
+    elif value <= 74:
+        emoji = "🤑"
+    else:
+        emoji = "🔥"
+
+    message = (
+        "📊 SENTIMIENTO DEL MERCADO\n\n"
+        f"Índice Fear & Greed: {value} {emoji}\n"
+        f"Estado: {sentiment}\n\n"
+        f"Hora: {current_time()}\n\n"
+        "👉 https://t.me/btcalertademo"
+    )
+
+    await bot.send_message(chat_id=CHANNEL_ID, text=message)
+
+
+async def maybe_send_momentum_alert(bot, current_price):
+    global last_alert_time
+
+    price_1m = get_price_ago(60)
+    price_5m = get_price_ago(300)
+    price_15m = get_price_ago(900)
+
+    change_1m = percent_change(current_price, price_1m)
+    change_5m = percent_change(current_price, price_5m)
+    change_15m = percent_change(current_price, price_15m)
+
+    if change_1m is None or change_5m is None or change_15m is None:
+        return
+
+    print(
+        f"Momentum debug: 1m={change_1m:.3f}% 5m={change_5m:.3f}% 15m={change_15m:.3f}%"
+    )
+
+    if not can_send_alert():
+        return
+
+    bullish = sum([
+        change_1m >= MOMENTUM_1M_THRESHOLD,
+        change_5m >= MOMENTUM_5M_THRESHOLD,
+        change_15m >= MOMENTUM_15M_THRESHOLD,
+    ])
+
+    bearish = sum([
+        change_1m <= -MOMENTUM_1M_THRESHOLD,
+        change_5m <= -MOMENTUM_5M_THRESHOLD,
+        change_15m <= -MOMENTUM_15M_THRESHOLD,
+    ])
+
+    strong_bullish = sum([
+        change_1m >= STRONG_1M_THRESHOLD,
+        change_5m >= STRONG_5M_THRESHOLD,
+        change_15m >= STRONG_15M_THRESHOLD,
+    ])
+
+    strong_bearish = sum([
+        change_1m <= -STRONG_1M_THRESHOLD,
+        change_5m <= -STRONG_5M_THRESHOLD,
+        change_15m <= -STRONG_15M_THRESHOLD,
+    ])
+
+    if strong_bullish >= 2:
+        message = (
+            "🚨 BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM ALCISTA FUERTE\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: +{change_1m:.2f}%\n"
+            f"Cambio 5m: +{change_5m:.2f}%\n"
+            f"Cambio 15m: +{change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Impulso comprador fuerte"
+        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=message)
+        last_alert_time = now_ts()
+        return
+
+    if strong_bearish >= 2:
+        message = (
+            "🚨 BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM BAJISTA FUERTE\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: {change_1m:.2f}%\n"
+            f"Cambio 5m: {change_5m:.2f}%\n"
+            f"Cambio 15m: {change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Presión vendedora fuerte"
+        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=message)
+        last_alert_time = now_ts()
+        return
+
+    if bullish >= 2:
+        message = (
+            "⚠️ BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM ALCISTA\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: +{change_1m:.2f}%\n"
+            f"Cambio 5m: +{change_5m:.2f}%\n"
+            f"Cambio 15m: +{change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Momentum alcista"
+        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=message)
+        last_alert_time = now_ts()
+        return
+
+    if bearish >= 2:
+        message = (
+            "⚠️ BTC MOMENTUM PRO\n\n"
+            "Movimiento detectado: MOMENTUM BAJISTA\n"
+            f"Precio actual: {format_price(current_price)}\n"
+            f"Cambio 1m: {change_1m:.2f}%\n"
+            f"Cambio 5m: {change_5m:.2f}%\n"
+            f"Cambio 15m: {change_15m:.2f}%\n"
+            f"Hora: {current_time()}\n"
+            "Estado: Momentum bajista"
+        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=message)
+        last_alert_time = now_ts()
+        return
+
+
+# =========================
+# MAIN
 # =========================
 async def main():
-    async with BTCDecisionBot(BOT_TOKEN, CHANNEL_ID) as app:
-        await app.run()
+    if not BOT_TOKEN:
+        raise ValueError("No se encontró TELEGRAM_BOT_TOKEN en variables de entorno.")
+
+    bot = Bot(token=BOT_TOKEN)
+
+    print("BTC MOMENTUM PRO iniciado")
+
+    initial_price = get_btc_price()
+    if initial_price is None:
+        raise RuntimeError("No se pudo obtener el precio inicial de BTC.")
+
+    add_price_to_history(initial_price)
+
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=(
+            "✅ BTC MOMENTUM PRO iniciado\n\n"
+            f"Precio actual: {format_price(initial_price)}\n"
+            f"Hora: {current_time()}\n"
+            "Modo: Momentum + Top Movers + Fear & Greed"
+        )
+    )
+
+    top_movers_counter = 0
+    fear_greed_counter = 0
+
+    while True:
+        try:
+            price = get_btc_price()
+
+            if price is not None:
+                print("BTC:", price)
+
+                add_price_to_history(price)
+
+                await maybe_send_momentum_alert(bot, price)
+
+                top_movers_counter += 1
+                fear_greed_counter += 1
+
+                # cada 4 horas
+                if top_movers_counter >= 480:
+                    await send_top_movers(bot)
+                    top_movers_counter = 0
+
+                # cada 8 horas
+                if fear_greed_counter >= 960:
+                    await send_fear_and_greed(bot)
+                    fear_greed_counter = 0
+
+            else:
+                print("No se obtuvo precio en este ciclo.")
+
+        except Exception as e:
+            print("Error general:", e)
+
+        await asyncio.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
